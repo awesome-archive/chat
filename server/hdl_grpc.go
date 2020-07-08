@@ -13,11 +13,13 @@ import (
 	"crypto/tls"
 	"io"
 	"log"
-	"net"
+	"time"
 
 	"github.com/tinode/chat/pbx"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/peer"
 )
 
 type grpcNodeServer struct {
@@ -33,7 +35,11 @@ func (sess *Session) closeGrpc() {
 
 // Equivalent of starting a new session and a read loop in one
 func (*grpcNodeServer) MessageLoop(stream pbx.Node_MessageLoopServer) error {
-	sess, _ := globals.sessionStore.NewSession(stream, "")
+	sess, count := globals.sessionStore.NewSession(stream, "")
+	if p, ok := peer.FromContext(stream.Context()); ok {
+		sess.remoteAddr = p.Addr.String()
+	}
+	log.Println("grpc: session started", sess.sid, sess.remoteAddr, count)
 
 	defer func() {
 		sess.closeGrpc()
@@ -78,10 +84,21 @@ func (sess *Session) writeGrpcLoop() {
 				// channel closed
 				return
 			}
+			if len(sess.send) > sendQueueLimit {
+				log.Println("grpc: outbound queue limit exceeded", sess.sid)
+				return
+			}
 			if err := grpcWrite(sess, msg); err != nil {
 				log.Println("grpc: write", sess.sid, err)
 				return
 			}
+
+		case <-sess.bkgTimer.C:
+			if sess.background {
+				sess.background = false
+				sess.onBackgroundTimer()
+			}
+
 		case msg := <-sess.stop:
 			// Shutdown requested, don't care if the message is delivered
 			if msg != nil {
@@ -104,12 +121,12 @@ func grpcWrite(sess *Session, msg interface{}) error {
 	return nil
 }
 
-func serveGrpc(addr string, tlsConf *tls.Config) (*grpc.Server, error) {
+func serveGrpc(addr string, kaEnabled bool, tlsConf *tls.Config) (*grpc.Server, error) {
 	if addr == "" {
 		return nil, nil
 	}
 
-	lis, err := net.Listen("tcp", addr)
+	lis, err := netListener(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +138,21 @@ func serveGrpc(addr string, tlsConf *tls.Config) (*grpc.Server, error) {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConf)))
 		secure = " secure"
 	}
+
+	if kaEnabled {
+		kepConfig := keepalive.EnforcementPolicy{
+			MinTime:             1 * time.Second, // If a client pings more than once every second, terminate the connection
+			PermitWithoutStream: true,            // Allow pings even when there are no active streams
+		}
+		opts = append(opts, grpc.KeepaliveEnforcementPolicy(kepConfig))
+
+		kpConfig := keepalive.ServerParameters{
+			Time:    60 * time.Second, // Ping the client if it is idle for 60 seconds to ensure the connection is still active
+			Timeout: 20 * time.Second, // Wait 20 second for the ping ack before assuming the connection is dead
+		}
+		opts = append(opts, grpc.KeepaliveParams(kpConfig))
+	}
+
 	srv := grpc.NewServer(opts...)
 	pbx.RegisterNodeServer(srv, &grpcNodeServer{})
 	log.Printf("gRPC/%s%s server is registered at [%s]", grpc.Version, secure, addr)
